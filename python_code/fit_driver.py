@@ -1,6 +1,7 @@
 import numpy as np
 from method_a_fit import MethodAFit
 
+
 def _require_iminuit():
     try:
         from iminuit import Minuit
@@ -10,32 +11,24 @@ def _require_iminuit():
             "iminuit is required for fitting. Install it with: pip install iminuit"
         ) from e
 
-def fit_noE(argv, *, verbose: bool = True):
-    """
-    Mirror of C++ fit_noE:
-      - load teardrop (long-form CSV iE,itp,content)
-      - scale like ROOT
-      - build fit region from data
-      - run minimization with iminuit
-    Returns: (methodA, best_params_array, minuit_object)
-    """
-    if len(argv) < 1:
-        raise ValueError("fit_noE expects argv[0] = teardrop CSV path")
 
-    teardrop_csv = argv[0]
+def _require_matplotlib_pyplot():
+    try:
+        import matplotlib.pyplot as plt
+        return plt
+    except Exception as e:
+        raise ImportError(
+            "matplotlib is required for plotting. Install it with: pip install matplotlib"
+        ) from e
 
-    methodA = MethodAFit(verbose=verbose)
-    methodA.load_teardrop_csv_long(teardrop_csv, allow_resize=True)
 
-    # Build fit region like C++
-    methodA.build_fit_region_from_data()
-
-    # Default parameters copied from methodAFit.cpp::fit_noE()
+def _default_fit_parameters() -> np.ndarray:
+    """Default parameters copied from methodAFit.cpp::fit_noE()."""
     p0 = np.zeros(23, dtype=float)
     p0[0] = -0.10   # a
     p0[1] = 0.00    # b
-    p0[2] = 0.91    # log10N (matches C++ fit_noE defaults)
-    p0[3] = 0.76    # cosThetaMin (matches C++ fit_noE defaults)
+    p0[2] = 0.91    # log10N
+    p0[3] = 0.76    # cosThetaMin
 
     p0[4] = 0.09    # LNabM5 (so A_L = p0[4] + 5)
     p0[5] = 0.60    # alpha
@@ -43,7 +36,7 @@ def fit_noE(argv, *, verbose: bool = True):
     p0[7] = 2.10    # gamma
     p0[8] = 0.056   # eta
 
-    p0[9]  = -0.132 # z0_center
+    p0[9] = -0.132  # z0_center
     p0[10] = 0.08   # z0_width
     p0[11] = 0.01   # missdet
     p0[12] = 0.00   # tailfrac
@@ -60,9 +53,94 @@ def fit_noE(argv, *, verbose: bool = True):
     p0[20] = 1.0
     p0[21] = 0.0
     p0[22] = 1.5
+    return p0
+
+
+def _plot_hist2d(methodA: MethodAFit, hist2d: np.ndarray, title: str, *, save_path: str | None = None) -> None:
+    """Plot a MethodA 2D histogram with physical axis units."""
+    plt = _require_matplotlib_pyplot()
+
+    fig, ax = plt.subplots(figsize=(7, 5))
+    im = ax.imshow(
+        hist2d.T,
+        origin="lower",
+        aspect="auto",
+        extent=[methodA.xmin, methodA.xmax, methodA.ymin, methodA.ymax],
+    )
+    ax.set_title(title)
+    ax.set_xlabel("Electron energy Ee (eV)")
+    ax.set_ylabel("Et^2 (s^-2)")
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("Normalized counts")
+    fig.tight_layout()
+
+    if save_path is not None:
+        fig.savefig(save_path, dpi=150)
+    plt.show()
+
+
+def fit_noE(
+    argv,
+    *,
+    verbose: bool = True,
+    quick_sanity: bool = False,
+    plot_histograms: bool = False,
+    prefit_plot_path: str | None = None,
+    postfit_plot_path: str | None = None,
+):
+    """
+    Mirror of C++ fit_noE with optional convenience controls.
+
+    Args:
+      argv[0]: teardrop CSV path (long-form iE,itp,content)
+      quick_sanity: if True, do a single model evaluation at defaults and skip minimization
+      plot_histograms: if True, plot the loaded data histogram before fitting and model after fit
+      prefit_plot_path/postfit_plot_path: optional output paths for saved PNGs
+
+    Returns:
+      (methodA, best_params_array, minuit_object)
+      In quick_sanity mode minuit_object is None and best_params_array is the start vector.
+    """
+    if len(argv) < 1:
+        raise ValueError("fit_noE expects argv[0] = teardrop CSV path")
+
+    teardrop_csv = argv[0]
+
+    methodA = MethodAFit(verbose=verbose)
+    methodA.load_teardrop_csv_long(teardrop_csv, allow_resize=True)
+
+    # Build fit region like C++
+    methodA.build_fit_region_from_data()
+
+    p0 = _default_fit_parameters()
 
     if verbose:
         methodA.sanity_checks()
+
+    if plot_histograms:
+        _plot_hist2d(
+            methodA,
+            methodA.h_data,
+            "Input data histogram used for fit (after CSV load/normalization)",
+            save_path=prefit_plot_path,
+        )
+
+    # Fast sanity mode: run one model prediction and stop.
+    if quick_sanity:
+        methodA.simulateET2SpecMethodA(p0)
+        chi2_0 = methodA.chi2(p0)
+        if verbose:
+            print(f"[fit_noE quick_sanity] Single-eval chi2(start) = {chi2_0}")
+
+        if plot_histograms:
+            _plot_hist2d(
+                methodA,
+                methodA.h_fit2D,
+                "Quick sanity model histogram (single evaluation, no minimization)",
+                save_path=postfit_plot_path,
+            )
+
+        return methodA, p0.copy(), None
 
     # iminuit setup
     Minuit = _require_iminuit()
@@ -112,7 +190,6 @@ def fit_noE(argv, *, verbose: bool = True):
     # Parameter limits matching the C++ SetParameter calls where present
     m.limits["a_ev"] = (-1.0, 1.0)
     m.limits["b_Fierz"] = (-0.5, 0.5)
-    # log10N had no explicit limits in C++ but keep reasonable
     m.limits["costhetamin"] = (0.0, 1.0)
     m.limits["LNabM5"] = (-0.2, 0.7)
     m.limits["sigmaEe_keV"] = (0.0, 10.0)
@@ -135,22 +212,15 @@ def fit_noE(argv, *, verbose: bool = True):
     m.fixed["EeNonLinearity"] = True
     m.fixed["sigmaEe_keV"] = True
 
-    # Make Minuit more verbose initially
     m.errordef = 1.0
     m.print_level = 2 if verbose else 0
 
     if verbose:
-        # Force one evaluation at the starting point
         print("[fit_noE] Pre-migrad sanity eval")
-
-        # actually build model at the start point
         methodA.simulateET2SpecMethodA(p0)
-
-        # optional: compute chi2 directly
         chi2_0 = methodA.chi2(p0)
         print(f"[fit_noE] chi2(start) = {chi2_0}")
 
-        # Slice compare at ix450 (your fit-region uses this)
         ix = getattr(methodA, "ix450", 45)
         d = methodA.h_data[ix, :]
         f = methodA.h_fit2D[ix, :]
@@ -171,13 +241,13 @@ def fit_noE(argv, *, verbose: bool = True):
             print(f"[slice dbg] ix={ix}  fit has no nonzero bins (bad)")
 
         print("[fit_noE] Starting migrad")
+
     m.migrad()
 
     if verbose:
         print("[fit_noE] migrad done")
         print(m)
 
-    # Extract best params in the same vector order
     best = np.array([
         m.values["a_ev"],
         m.values["b_Fierz"],
@@ -203,5 +273,14 @@ def fit_noE(argv, *, verbose: bool = True):
         m.values["EeNonLinearity"],
         m.values["sigmaEe_keV"],
     ], dtype=float)
+
+    methodA.simulateET2SpecMethodA(best)
+    if plot_histograms:
+        _plot_hist2d(
+            methodA,
+            methodA.h_fit2D,
+            "Post-fit model histogram",
+            save_path=postfit_plot_path,
+        )
 
     return methodA, best, m
