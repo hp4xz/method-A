@@ -1,6 +1,6 @@
 import numpy as np
 import math
-import physics_updated as physics
+import physics as physics
 
 class MethodAFit:
     """
@@ -277,12 +277,17 @@ class MethodAFit:
     # Energy calibration (C++ eECal)
     # -----------------------
     def eECal(self, eE_guess: float, calibration: np.ndarray) -> float:
-        # C++: calEe*(eE_guess + Ep_offset) + nonlin*(eE_guess+Ep_offset)^2 - Ep_offset
+        # C++ eECal(e2, offset, gain, Nonlin):
+        #   energyADC = offset + gain*e2 + (Nonlin/1e6)*gain*gain*e2*e2
+        # Here, eE_guess is the dimensionless e2 index-like coordinate.
         calEe = float(calibration[0])
         nonlin = float(calibration[1])
-        Ep_off = 1000.0  # fitOpt::Ep_offset_for_e2
-        x = eE_guess + Ep_off
-        return calEe * x + nonlin * x * x - Ep_off
+        offset = self.e2_start
+        gain = calEe * self.e2_step
+        energy_adc = offset + gain * eE_guess + (nonlin / 1e6) * gain * gain * eE_guess * eE_guess
+        if energy_adc < 0.0 or energy_adc > physics.E0:
+            return 0.0
+        return energy_adc
 
     # -----------------------
     # HV mapping (present in C++ but optional)
@@ -566,7 +571,7 @@ class MethodAFit:
         # Determine n_dE like C++
         n_dE = 1
         if sigmaEe_keV > 0:
-            n_dE = int(round(self.e2_step / 1000.0 / sigmaEe_keV))
+            n_dE = int(math.floor(self.e2_step / 1000.0 / sigmaEe_keV + 0.5))
             if n_dE < 1:
                 n_dE = 1
 
@@ -579,10 +584,9 @@ class MethodAFit:
             ioffset = ie * self.numBinsY
 
             for ide in range(n_dE):
-                # Energy smear positions within bin
-                # C++ uses:
-                #   e2_guess = di_to_e2(ie) + (ide+0.5)/n_dE * e2_step
-                e2_guess = self.di_to_e2(ie) + (ide + 0.5) * self.e2_step / float(n_dE)
+                # C++ passes an index-like variable into eECal:
+                #   ie + (ide+0.5)/n_dE
+                e2_guess = float(ie) + (ide + 0.5) / float(n_dE)
 
                 # calibrated energy
                 e2_cal = self.eECal(e2_guess, calibration)
@@ -593,8 +597,8 @@ class MethodAFit:
                     continue
 
                 # probability weight in this energy slice (spectrum integral)
-                eMin = e2_cal - 0.5 * self.e2_step / float(n_dE)
-                eMax = e2_cal + 0.5 * self.e2_step / float(n_dE)
+                eMin = self.eECal(float(ie) + float(ide) / float(n_dE), calibration)
+                eMax = self.eECal(float(ie) + (float(ide) + 1.0) / float(n_dE), calibration)
                 e2prob = self.numElectrons(eMin, eMax, b_F)
 
                 # pp2 bounds at this energy
@@ -604,7 +608,9 @@ class MethodAFit:
                 # Print once for the Ee ~ 450 keV bin (ix450), first time we hit it
                 if ie == getattr(self, "ix450", -999) and getattr(self, "_dbg_pp2_done", False) is False:
                     self._dbg_pp2_done = True
-                    print(f"[pp2 dbg] ie={ie} Ee={Ee:.1f} eV")
+                    ppmin = physics.ppmin(e2_cal)
+                    ppmax = physics.ppmax(e2_cal)
+                    print(f"[pp2 dbg] ie={ie} Ee={e2_cal:.1f} eV")
                     print(f"          ppmin={ppmin:.6e}  ppmax={ppmax:.6e}  (eV/c)")
                     print(f"          pp2min={pp2min:.6e}  pp2max={pp2max:.6e}  ((eV/c)^2)")
 
@@ -620,8 +626,10 @@ class MethodAFit:
                 if pp2max <= pp2min:
                     continue
 
-                # npp in C++ is 400
-                npp = 400
+                # C++: npp = 5*FloorNint(t2factor*(pp2max-pp2min)/(A_L*A_L)/Et2_step + 0.5), capped at 1000
+                npp_base = physics.t2factor * (pp2max - pp2min) / (A_L * A_L) / self.Et2_step + 0.5
+                npp = 5 * int(math.floor(npp_base + 0.5))
+                npp = max(1, min(npp, 1000))
 
                 for ipos in range(self.npos):
                     # z smear: midpoint samples across [-width/2, +width/2]
@@ -634,14 +642,14 @@ class MethodAFit:
                         # midpoint sample
                         pp2 = pp2min + (ipp + 0.5) * (pp2max - pp2min) / float(npp)
 
-                        ppmid = 0.5 * (pp2min + pp2max)
-                        denom = 0.5 * (pp2max - pp2min)
-                        if denom <= 0:
+                        pp2mid = physics.ppmid2(e2_cal)
+                        pp2denom = 2.0 * (e2_cal + physics.me) * (physics.delta - physics.me - e2_cal)
+                        if pp2denom == 0:
                             continue
 
                         # P_p2 in C++
                         fierz_fac = physics.me / (e2_cal + physics.me) if (e2_cal + physics.me) != 0 else 0.0
-                        numer = 1.0 + a_ev * (pp2 - ppmid) / denom + b_F * fierz_fac
+                        numer = 1.0 + a_ev * (pp2 - pp2mid) / pp2denom + b_F * fierz_fac
                         denom_f = 1.0 + b_F * fierz_fac
                         P_p2 = numer / denom_f if denom_f != 0 else 0.0
 
@@ -662,7 +670,7 @@ class MethodAFit:
 
                         cosMin = float(A_cosThetaMin) + 1.0e-6
                         cosMax = 1.0
-                        self.FillChannels(ioffset, cosMin, cosMax, pp2, intensTmp, parA)
+                        self.FillChannels(ioffset, cosMin, cosMax, pp2, intensTmp, parA_tmp)
 
 
 
@@ -681,9 +689,10 @@ class MethodAFit:
     # Fit region setup (C++ fit_noE block)
     # -----------------------
     def build_fit_region_from_data(self) -> None:
-        ix450 = int(round(self.e2_to_di(450000.0))) + 1  # C++: FloorNint +1
+        ix450 = int(math.floor(self.e2_to_di(450000.0) + 0.5)) + 1  # C++: FloorNint +1
         ix450 = max(1, min(ix450, self.numBinsX))
         ix = ix450 - 1
+        self.ix450 = ix
 
         events_in_slice = float(np.sum(self.h_data[ix, :]))
         if events_in_slice <= 0.0:
@@ -778,8 +787,8 @@ class MethodAFit:
             low = self.h_low_outer[ix] if self.h_low_outer[ix] != 0 else self.ymin
             up  = self.h_up_outer[ix]  if self.h_up_outer[ix]  != 0 else self.ymax
 
-            ilow = int(math.floor(self.Et2_to_di(low)))
-            iup  = int(math.floor(self.Et2_to_di(up)))
+            ilow = int(math.floor(self.Et2_to_di(low) + 0.5))
+            iup  = int(math.floor(self.Et2_to_di(up) + 0.5))
 
             if self.FitRegionIncludesEdges:
                 ilow = max(ilow, 0)
