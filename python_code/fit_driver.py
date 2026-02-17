@@ -1,5 +1,5 @@
 import numpy as np
-from method_a_fit_updated import MethodAFit
+from method_a_fit import MethodAFit
 
 def _require_iminuit():
     try:
@@ -34,8 +34,8 @@ def fit_noE(argv, *, verbose: bool = True):
     p0 = np.zeros(23, dtype=float)
     p0[0] = -0.10   # a
     p0[1] = 0.00    # b
-    p0[2] = 0.00    # log10N  (start at 0)
-    p0[3] = 0.00    # cosThetaMin  <-- THIS MUST BE 0.0 (per fitOpt::cosThetaMin_)
+    p0[2] = 0.91    # log10N (matches C++ fit_noE defaults)
+    p0[3] = 0.76    # cosThetaMin (matches C++ fit_noE defaults)
 
     p0[4] = 0.09    # LNabM5 (so A_L = p0[4] + 5)
     p0[5] = 0.60    # alpha
@@ -117,15 +117,29 @@ def fit_noE(argv, *, verbose: bool = True):
     m.limits["LNabM5"] = (-0.2, 0.7)
     m.limits["sigmaEe_keV"] = (0.0, 10.0)
 
-    # Fixing parameters like the C++ example: costhetamin fixed
+    # Fix parameters to match C++ fit_noE configuration
     m.fixed["costhetamin"] = True
+    m.fixed["gamma"] = True
+    m.fixed["z0_center"] = True
+    m.fixed["z0_width"] = True
+    m.fixed["missdet"] = True
+    m.fixed["tailfrac"] = True
+    m.fixed["tailVal"] = True
+    m.fixed["hvMapMin1"] = True
+    m.fixed["hvMap0"] = True
+    m.fixed["hvMap1"] = True
+    m.fixed["hvMap2"] = True
+    m.fixed["hvMap3"] = True
+    m.fixed["hvMap4"] = True
+    m.fixed["calEe"] = True
+    m.fixed["EeNonLinearity"] = True
+    m.fixed["sigmaEe_keV"] = True
 
     # Make Minuit more verbose initially
     m.errordef = 1.0
     m.print_level = 2 if verbose else 0
 
     if verbose:
-        print("[fit_noE] Pre-migrad sanity eval")
         # Force one evaluation at the starting point
         print("[fit_noE] Pre-migrad sanity eval")
 
@@ -134,8 +148,6 @@ def fit_noE(argv, *, verbose: bool = True):
 
         # optional: compute chi2 directly
         chi2_0 = methodA.chi2(p0)
-        print(f"[fit_noE] chi2(start) = {chi2_0}")
-
         print(f"[fit_noE] chi2(start) = {chi2_0}")
 
         # Slice compare at ix450 (your fit-region uses this)
